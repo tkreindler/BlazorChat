@@ -1,0 +1,240 @@
+﻿@page "/"
+@using Microsoft.AspNetCore.SignalR.Client
+@using BlazorChat.Shared
+@inject NavigationManager NavigationManager
+@inject IJSRuntime JS
+@implements IAsyncDisposable
+
+<div class="container">
+    <div class="row">
+        <div class="col">
+            <div class="form-group">
+                <label>
+                    User:
+                    <input @bind="userInput" />
+                </label>
+            </div>
+            <button @onclick="Connect" disabled="@(!this.IsSocketConnected || this.IsRegistered)">Connect</button>
+        </div>
+    </div>
+    <div class="row">
+        <div class="col">
+            <ul>
+                @foreach (var user in this.users)
+                {
+                    <li>
+                        @user.UserName
+                        @{
+                            switch(user.CallState)
+                            {
+                                case CallState.None:
+                                    <button @onclick="async () => await Call(user)" disabled="@(!this.IsSocketConnected || !this.IsRegistered)">Call</button>
+                                    break;
+                                case CallState.Outgoing:
+                                    <p>outgoing</p>
+                                    break;
+                                case CallState.Incoming:
+                                    <button @onclick="async () => await AcceptCall(user)">Accept</button>
+                                    <button @onclick="() => RejectCall(user)">Reject</button>
+                                    break;
+                                case CallState.Current:
+                                    <p>currently in a call</p>
+                                    break;
+                            }
+                        }
+                    </li>
+                }
+            </ul>
+        </div>
+    </div>
+    <div class="row">
+        <div class="col-md">
+            <video class="img-fluid" muted autoplay=@true id="localUserVideo" style="-webkit-transform: scaleX(-1); transform: scaleX(-1);">Webcam is not loaded yet</video>
+        </div>
+        <div class="col-md">
+            <video class="img-fluid" autoplay=@true id="remoteUserVideo">Remote webcam is not loaded yet</video>
+        </div>
+    </div>
+</div>
+
+@code {
+    private HubConnection hubConnection;
+    private string userInput;
+    private List<ClientUserData> users = new ();
+    private readonly Guid guid = Guid.NewGuid();
+
+    private Guid? CurrentlyCallingGuid = null;
+
+    private void OnReceiveUsers(UserData[] userDatas)
+    {
+        this.users.Clear();
+        this.users.AddRange(userDatas.Select((data) => new ClientUserData(data)));
+            
+        int foundIndex = -1;
+        int i = 0;
+        foreach (var userData in this.users)
+        {
+            if (userData.Guid == this.guid)
+            {
+                foundIndex = i;
+                break;
+            }
+            i++;
+        }
+            
+        if (foundIndex != -1)
+        {
+            this.users.RemoveAt(foundIndex);
+            this.IsRegistered = true;
+        }
+        else
+        {
+            this.IsRegistered = false;
+        }
+
+        StateHasChanged();
+    }
+
+    private async Task OnReceiveCall(Guid senderGuid)
+    {
+        foreach (var userData in this.users)
+        {
+            if (userData.Guid == senderGuid)
+            {
+                userData.CallState = CallState.Incoming;
+                StateHasChanged();
+
+                // no pickup
+                await Task.Delay(TimeSpan.FromSeconds(12));
+                if (userData.CallState == CallState.Incoming)
+                {
+                    userData.CallState = CallState.None;
+                    StateHasChanged();
+                }
+                return;
+            }
+        }
+    }
+
+    private async Task OnReceiveAcceptCall(Guid senderGuid)
+    {
+        this.CurrentlyCallingGuid = senderGuid;
+
+        foreach (var userData in this.users)
+        {
+            if (userData.Guid == senderGuid)
+            {
+                if (userData.CallState != CallState.Outgoing)
+                {
+                    throw new Exception("Received an accept request from a user we never sent to");
+                }
+                userData.CallState = CallState.Current;
+
+                await JS.InvokeVoidAsync("CreateCall", true);
+                StateHasChanged();
+                return;
+            }
+        }
+    }
+
+    private async Task OnReceiveRtcData(Guid senderGuid, string type, string data)
+    {
+        if (type == "sdp")
+        {
+            await JS.InvokeVoidAsync("OnReceiveSdp", data);
+        }
+        else if (type == "candidate")
+        {
+            await JS.InvokeVoidAsync("OnReceiveIceCandidate", data);
+        }
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        hubConnection = new HubConnectionBuilder()
+            .WithUrl(NavigationManager.ToAbsoluteUri("/chathub"))
+            .Build();
+
+        hubConnection.On<UserData[]>("ReceiveUsers", this.OnReceiveUsers);
+        hubConnection.On<Guid>("ReceiveCall", this.OnReceiveCall);
+        hubConnection.On<Guid>("ReceiveAcceptCall", this.OnReceiveAcceptCall);
+        hubConnection.On<Guid, string, string>("ReceiveRtcData", this.OnReceiveRtcData);
+
+        await hubConnection.StartAsync();
+    }
+
+    [JSInvokable("SendRtcData")]
+    public async Task SendRtcData(string type, string data)
+    {
+        if (this.CurrentlyCallingGuid is Guid callingGuid)
+        {
+            await hubConnection.InvokeAsync("SendRtcData", this.guid, callingGuid, type, data);
+        }
+        else
+        {
+            throw new Exception("CurrentlyCallingGuid is null when it shouldn't be");
+        }
+    }
+
+    public bool IsRegistered { get; private set; } = false;
+
+    public bool WebcamEnabled { get; private set; } = false;
+
+    async Task Connect() {
+        // pass a dotnet reference it stores for later use
+        var dotNetReference = DotNetObjectReference.Create(this);
+
+        // TODO: check if webcam works
+        await JS.InvokeVoidAsync("EnableWebcam", dotNetReference);
+        //if (!this.WebcamEnabled)
+        //{
+        //    return;
+        //}
+
+        if (!String.IsNullOrWhiteSpace(this.userInput))
+        {
+            await hubConnection.InvokeAsync("RegisterUser", this.guid, this.userInput);
+        }
+    }
+
+    async Task Call(ClientUserData user) {
+
+        user.CallState = CallState.Outgoing;
+        await hubConnection.InvokeAsync("Call", this.guid, user.Guid);
+        StateHasChanged();
+
+        // no pickup
+        await Task.Delay(TimeSpan.FromSeconds(15));
+        if (user.CallState == CallState.Outgoing)
+        {
+            user.CallState = CallState.None;
+            
+            StateHasChanged();
+        }
+    }
+
+    async Task AcceptCall(ClientUserData user) {
+        user.CallState = CallState.Current;
+        this.CurrentlyCallingGuid = user.Guid;
+        await JS.InvokeVoidAsync("CreateCall", false);
+        await hubConnection.InvokeAsync("AcceptCall", this.guid, user.Guid);
+        StateHasChanged();
+    }
+
+    void RejectCall(ClientUserData user) {
+
+        user.CallState = CallState.None;
+        StateHasChanged();
+    }
+
+    public bool IsSocketConnected =>
+        hubConnection.State == HubConnectionState.Connected;
+
+    public async ValueTask DisposeAsync()
+    {
+        if (hubConnection is not null)
+        {
+            await hubConnection.DisposeAsync();
+        }
+    }
+}
